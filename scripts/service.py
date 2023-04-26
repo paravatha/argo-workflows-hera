@@ -1,16 +1,16 @@
 import builtins
 import inspect
+import json
 import re
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional
-
+from model_type import ModelType
 import requests
 
 from hera.events import models as events_models
 from hera.workflows import models as workflows_models
-
-model_types = {"workflows", "events"}
 
 
 class Parameter:
@@ -45,7 +45,7 @@ class Parameter:
 
 
 class Response:
-    """The response type of a request"""
+    """The response type of request"""
 
     def __init__(self, ref: str) -> None:
         self.ref = ref
@@ -192,11 +192,12 @@ class ServiceEndpoint:
 """
 
 
-def get_models_type() -> str:
-    """Gets the model type to generate from argv and returns it. This is either `workflows` or `events`"""
-    assert len(sys.argv) == 3, "Expected two argv arguments - the Argo OpenAPI spec URL and [workflows|events]"
+def get_model_type() -> str:
+    """Gets the model type to generate from argv and returns it"""
+    assert len(sys.argv) == 3, \
+        f"Expected two argv arguments - the Argo OpenAPI spec URL and one of: {ModelType.values()}"
     arg = sys.argv[2]
-    assert arg in model_types, f"Unsupported model type {arg}, expected one of {model_types}"
+    assert ModelType.is_valid(arg), f"Unsupported model type {arg}, expected one of {ModelType.values()}"
     return arg
 
 
@@ -260,7 +261,7 @@ def parse_operation_id(operation_id: str) -> str:
     return operation_snake_case.lower()
 
 
-def get_class(cls_name: str, models_type: str) -> type:
+def get_class(cls_name: str, model_type: str) -> type:
     """Returns the Argo Workflows/Events class association based on the specified models type.
 
     This intentionally has an empty return to catch cases when the class it not found. This will cause dep
@@ -268,7 +269,7 @@ def get_class(cls_name: str, models_type: str) -> type:
     """
 
     switch = {"workflows": workflows_models, "events": events_models}
-    modules = inspect.getmembers(switch.get(models_type))
+    modules = inspect.getmembers(switch.get(model_type))
     for module in modules:
         curr_cls = module[1]
         if inspect.isclass(curr_cls) and curr_cls.__name__ == cls_name:
@@ -282,7 +283,7 @@ def parse_builtin(f: str) -> str:
     return f
 
 
-def parse_parameter(parameter: dict, models_type: str) -> Parameter:
+def parse_parameter(parameter: dict, model_type: str) -> Parameter:
     """Parses the given dictionary representation of a `Parameter` into a proper `Parameter` type based on model type"""
     openapi_type_switch = {
         "string": str,
@@ -301,7 +302,7 @@ def parse_parameter(parameter: dict, models_type: str) -> Parameter:
     if "type" in parameter:
         type_ = openapi_type_switch.get(parameter.get("type"))
     elif "schema" in parameter:
-        type_ = get_class(parameter.get("schema").get("$ref").split(".")[-1], models_type)
+        type_ = get_class(parameter.get("schema").get("$ref").split(".")[-1], model_type)
     else:
         raise ValueError(f"Unrecognized parameter type from parameter {parameter}")
 
@@ -343,7 +344,7 @@ def parse_response(parameter: dict) -> Response:
 
 def get_endpoints(
     paths: dict,
-    models_type: str,
+    model_type: str,
     consumes: str = "application/json",
     produces: str = "application/json",
 ) -> List[ServiceEndpoint]:
@@ -352,7 +353,10 @@ def get_endpoints(
         "workflows": ["events", "event", "eventsource", "sensor"],
         "events": ["workflow", "workflows"],
     }
-    exceptions = switch.get(models_type)
+    # these "exceptions" represent anything that should be excluded from the generated
+    # service for the given Argo model type
+    exceptions = switch.get(model_type, [])
+
     endpoints = []
     for url, config in paths.items():
         found = False
@@ -365,35 +369,37 @@ def get_endpoints(
         for method, params in config.items():
             empty_param = False
             operation_id = parse_operation_id(params.get("operationId"))
-            endpoint_params = []
-            for parameter in params.get("parameters", []):
-                param = parse_parameter(parameter, models_type)
-                if param.type_ is None:
-                    empty_param = True
-                endpoint_params.append(param)
-            response = parse_response(params)
-            summary = params.get("summary")
-            if empty_param:
-                continue  # skip this endpoint
 
-            # exceptions for events
-            if operation_id == "event_sources_logs" and response.ref == "LogEntry":
-                response.ref = "EventsourceLogEntry"
-            if operation_id == "sensors_logs" and response.ref == "LogEntry":
-                response.ref = "SensorLogEntry"
+            if f"{snake_to_camel(model_type)}Service" == operation_id.split("_")[0]:
+                endpoint_params = []
+                for parameter in params.get("parameters", []):
+                    param = parse_parameter(parameter, model_type)
+                    if param.type_ is None:
+                        empty_param = True
+                    endpoint_params.append(param)
+                response = parse_response(params)
+                summary = params.get("summary")
+                if empty_param:
+                    continue  # skip this endpoint
 
-            endpoints.append(
-                ServiceEndpoint(
-                    url,
-                    method,
-                    operation_id,
-                    endpoint_params,
-                    response,
-                    summary,
-                    consumes=consumes,
-                    produces=produces,
+                # exceptions for events
+                if operation_id == "event_sources_logs" and response.ref == "LogEntry":
+                    response.ref = "EventsourceLogEntry"
+                if operation_id == "sensors_logs" and response.ref == "LogEntry":
+                    response.ref = "SensorLogEntry"
+
+                endpoints.append(
+                    ServiceEndpoint(
+                        url,
+                        method,
+                        operation_id,
+                        endpoint_params,
+                        response,
+                        summary,
+                        consumes=consumes,
+                        produces=produces,
+                    )
                 )
-            )
     return endpoints
 
 
@@ -406,7 +412,7 @@ from hera.{module}.models import {imports}
 from hera.shared import global_config
 from typing import Optional, cast
 
-class {models_type}Service:
+class {model_type}Service:
     def __init__(
         self,
         host: Optional[str] = None,
@@ -421,12 +427,12 @@ class {models_type}Service:
 """
 
 
-def make_service(service_def: str, endpoints: List[ServiceEndpoint], models_type: str) -> str:
+def make_service(service_def: str, endpoints: List[ServiceEndpoint], model_type: str) -> str:
     """Makes the service definitions based on the given endpoints for the given model type"""
     result = service_def
     for endpoint in endpoints:
         result = result + f"{endpoint}\n"
-    result = result + f"\n\n__all__ = ['{models_type.capitalize()}Service']"
+    result = result + f"\n\n__all__ = ['{model_type.capitalize()}Service']"
     return result
 
 
@@ -456,26 +462,32 @@ def get_imports(endpoints: List[ServiceEndpoint]) -> List[str]:
 
 
 if __name__ == "__main__":
-    url = get_openapi_spec_url()
-    models_type = get_models_type()
-    payload = fetch_openapi_spec(url)
+    # url = get_openapi_spec_url()
+    # model_type = get_model_type()
+    model_type = "account"
+    # payload = fetch_openapi_spec(url)
+    payload = json.load(open(str(Path(__name__).parent.parent / 'argo-cd-openapi.json')))
+
     consumes = get_consumes(payload)
     produces = get_produces(payload)
     paths = get_paths(payload)
-    endpoints = get_endpoints(paths, models_type, consumes=consumes, produces=produces)
+    endpoints = get_endpoints(paths, model_type, consumes=consumes, produces=produces)
     imports = get_imports(endpoints)
     service_def = get_service_def()
     service_def = service_def.format(
         imports=", ".join(imports),
-        module=models_type,
-        models_type=models_type.capitalize(),
+        module=model_type,
+        model_type=model_type.capitalize(),
     )
-    result = make_service(service_def, endpoints, models_type)
+    result = make_service(service_def, endpoints, model_type)
 
-    if models_type == "workflows":
+    if model_type == "workflows":
         result = result.replace("LogEntry", "V1alpha1LogEntry")
-    elif models_type == "events":
+    elif model_type == "events":
         result = result.replace("LogEntry", "LogEntry")
 
-    path = Path(__name__).parent / f"src/hera/{models_type}/service.py"
+    dir_path = Path(__name__).parent / f"src/hera/{model_type}"
+    dir_path.mkdir(exist_ok=True)
+
+    path = dir_path / "service.py"
     write_service(result, path)

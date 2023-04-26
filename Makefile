@@ -63,6 +63,21 @@ events-models: ## Generate the Events models portion of Argo Workflows
 	@poetry run stubgen -o src -p hera.events.models && rm -rf **/__init__.pyi
 	@$(MAKE) format
 
+.PHONY: account-models
+account-models: ## Generate the Account models portion of Argo CD
+	@poetry run datamodel-codegen \
+		--input argo-cd-openapi.json \
+		--snake-case-field \
+		--target-python-version 3.7 \
+		--output src/hera/account/models.py \
+		--base-class hera.shared._base_model.BaseModel \
+		--wrap-string-literal \
+		--disable-appending-item-suffix \
+		--disable-timestamp
+#	@poetry run python scripts/models.py $(OPENAPI_SPEC_URL) accounts
+#	@poetry run stubgen -o src -p hera.account.models && rm -rf **/__init__.pyi
+#	@$(MAKE) format
+
 .PHONY: models
 models: ## Generate all the Argo Workflows models
 models: workflows-models events-models
@@ -76,6 +91,11 @@ workflows-service:  ## Generate the Workflows service option of Hera
 events-service:  ## Generate the events service option of Hera
 	@poetry run python scripts/service.py $(OPENAPI_SPEC_URL) events
 	$(MAKE) format
+
+.PHONY: account-service
+account-service:  ## Generate the Argo CD account service for Hera
+	@poetry run python scripts/service.py #$(OPENAPI_SPEC_URL) account
+	#$(MAKE) format
 
 .PHONY: services
 services:  ## Generate the services of Hera
