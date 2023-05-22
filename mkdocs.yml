@@ -13,6 +13,7 @@ nav:
         - ... | flat | examples/workflows/*.md
       - Upstream:
         - ... | flat | examples/workflows/upstream/*.md
+  - v4 to v5 migration guide: v4_to_v5_migration_guide.md
   - API Reference:
     - Shared: api/shared.md
     - Workflows:
